@@ -37,7 +37,6 @@ pub(crate) enum Constructor<T> {
     #[allow(clippy::type_complexity)]
     Async(Rc<dyn for<'a> Fn(&'a mut Context) -> BoxFuture<'a, T>>),
     Sync(Rc<dyn Fn(&mut Context) -> T>),
-    None,
 }
 
 impl<T> Clone for Constructor<T> {
@@ -45,7 +44,6 @@ impl<T> Clone for Constructor<T> {
         match self {
             Self::Async(c) => Self::Async(Rc::clone(c)),
             Self::Sync(c) => Self::Sync(Rc::clone(c)),
-            Self::None => Self::None,
         }
     }
 }
@@ -81,7 +79,7 @@ pub struct Provider<T> {
     definition: Definition,
     eager_create: bool,
     condition: Option<fn(&Context) -> bool>,
-    constructor: Constructor<T>,
+    constructor: Option<Constructor<T>>,
     clone_instance: Option<fn(&T) -> T>,
     eager_create_function: EagerCreateFunction,
     binding_providers: Option<Vec<DynProvider>>,
@@ -109,7 +107,7 @@ impl<T> Provider<T> {
         self.condition
     }
 
-    pub(crate) fn constructor(&self) -> Constructor<T> {
+    pub(crate) fn constructor(&self) -> Option<Constructor<T>> {
         self.constructor.clone()
     }
 
@@ -128,14 +126,15 @@ impl<T: 'static> Provider<T> {
         clone_instance: Option<fn(&T) -> T>,
         eager_create_function: EagerCreateFunction,
     ) -> Self {
+        let color = match &constructor {
+            Constructor::Async(_) => Color::Async,
+            Constructor::Sync(_) => Color::Sync,
+        };
+
         let definition = Definition::new::<T>(
             name,
             scope,
-            Some(match constructor {
-                Constructor::Async(_) => Color::Async,
-                Constructor::Sync(_) => Color::Sync,
-                Constructor::None => unreachable!(),
-            }),
+            Some(color),
             condition.is_some(),
         );
 
@@ -143,7 +142,7 @@ impl<T: 'static> Provider<T> {
             definition,
             eager_create,
             condition,
-            constructor,
+            constructor: Some(constructor),
             clone_instance,
             eager_create_function,
             binding_providers: None,
@@ -163,7 +162,7 @@ impl<T: 'static> Provider<T> {
             definition,
             eager_create,
             condition,
-            constructor,
+            constructor: Some(constructor),
             clone_instance,
             eager_create_function,
             binding_providers: None,
@@ -176,7 +175,7 @@ impl<T: 'static> Provider<T> {
             definition: Definition::new::<T>(name, scope, None, false),
             eager_create: false,
             condition: None,
-            constructor: Constructor::None,
+            constructor: None,
             clone_instance: None,
             eager_create_function: EagerCreateFunction::None,
             binding_providers: None,
@@ -347,11 +346,6 @@ macro_rules! define_provider_common {
             }
         }
 
-        impl<T: 'static $(+ $bound)*> From<$provider<T>> for DynProvider {
-            fn from(value: $provider<T>) -> Self {
-                DynProvider::from(Provider::from(value))
-            }
-        }
     };
 }
 
@@ -494,6 +488,64 @@ macro_rules! define_provider_sync {
                 provider.binding_providers = Some(providers);
 
                 provider
+            }
+        }
+
+        impl<T: 'static $(+ $bound)*> From<$provider<T>> for DynProvider {
+            fn from(value: $provider<T>) -> Self {
+                if value.bind_closures.is_empty() {
+                    // Fast path: build DynProvider directly without redundant clones.
+                    // Construct the Definition and EagerCreateFunction once, clone for
+                    // the Provider<T> origin box, and move the originals into DynProvider.
+                    let $provider {
+                        constructor,
+                        name,
+                        eager_create,
+                        condition,
+                        bind_closures: _,
+                    } = value;
+
+                    let eager_create_function = EagerCreateFunction::Sync(
+                        sync_eager_create_function::<T>()
+                    );
+
+                    let color = match &constructor {
+                        Constructor::Async(_) => Color::Async,
+                        Constructor::Sync(_) => Color::Sync,
+                    };
+
+                    let definition = Definition::new::<T>(
+                        name,
+                        $scope,
+                        Some(color),
+                        condition.is_some(),
+                    );
+
+                    let origin = Provider {
+                        definition: definition.clone(),
+                        eager_create,
+                        condition,
+                        constructor: Some(constructor),
+                        clone_instance: $clone_instance,
+                        eager_create_function: eager_create_function.clone(),
+                        binding_providers: None,
+                        binding_definitions: None,
+                    };
+
+                    DynProvider {
+                        definition,
+                        eager_create,
+                        condition,
+                        eager_create_function,
+                        binding_providers: None,
+                        binding_definitions: None,
+                        origin: Box::new(origin),
+                    }
+                } else {
+                    // Slow path: bind_closures need the Provider's definition,
+                    // fall back to the two-step conversion.
+                    DynProvider::from(Provider::from(value))
+                }
             }
         }
     };
@@ -640,6 +692,64 @@ macro_rules! define_provider_async {
                 provider.binding_providers = Some(providers);
 
                 provider
+            }
+        }
+
+        impl<T: 'static $(+ $bound)*> From<$provider<T>> for DynProvider {
+            fn from(value: $provider<T>) -> Self {
+                if value.bind_closures.is_empty() {
+                    // Fast path: build DynProvider directly without redundant clones.
+                    // Construct the Definition and EagerCreateFunction once, clone for
+                    // the Provider<T> origin box, and move the originals into DynProvider.
+                    let $provider {
+                        constructor,
+                        name,
+                        eager_create,
+                        condition,
+                        bind_closures: _,
+                    } = value;
+
+                    let eager_create_function = EagerCreateFunction::Async(
+                        async_eager_create_function::<T>()
+                    );
+
+                    let color = match &constructor {
+                        Constructor::Async(_) => Color::Async,
+                        Constructor::Sync(_) => Color::Sync,
+                    };
+
+                    let definition = Definition::new::<T>(
+                        name,
+                        $scope,
+                        Some(color),
+                        condition.is_some(),
+                    );
+
+                    let origin = Provider {
+                        definition: definition.clone(),
+                        eager_create,
+                        condition,
+                        constructor: Some(constructor),
+                        clone_instance: $clone_instance,
+                        eager_create_function: eager_create_function.clone(),
+                        binding_providers: None,
+                        binding_definitions: None,
+                    };
+
+                    DynProvider {
+                        definition,
+                        eager_create,
+                        condition,
+                        eager_create_function,
+                        binding_providers: None,
+                        binding_definitions: None,
+                        origin: Box::new(origin),
+                    }
+                } else {
+                    // Slow path: bind_closures need the Provider's definition,
+                    // fall back to the two-step conversion.
+                    DynProvider::from(Provider::from(value))
+                }
             }
         }
     };

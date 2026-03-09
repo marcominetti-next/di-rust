@@ -1,0 +1,10 @@
+[package]
+name = "from-attr-core"
+description = "from-attr core type"
+keywords = ["attributes", "derive", "macro"]
+version = "0.9.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+syn = { workspace = true, features = ["parsing"] }

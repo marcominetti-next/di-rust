@@ -26,7 +26,7 @@ fn allow_override_by_type() {
 
     let mut cx = Context::create(modules![Module1, Module2]);
     // Component1, Component2, Rc<dyn Trait1>
-    assert_eq!(cx.provider_registry().len(), 3);
+    assert_eq!(cx.provider_registry_len(), 3);
 
     let instance = cx.resolve::<Rc<dyn Trait1>>();
     assert!(instance.as_any().is::<Component1>());
@@ -60,7 +60,7 @@ fn allow_override_by_name() {
 
     let mut cx = Context::create(modules![Module1, Module2]);
     // Component1, Component2, Rc<dyn Trait1>
-    assert_eq!(cx.provider_registry().len(), 3);
+    assert_eq!(cx.provider_registry_len(), 3);
 
     let instance = cx.resolve_with_name::<Rc<dyn Trait1>>("hello");
     assert!(instance.as_any().is::<Component1>());
@@ -93,7 +93,7 @@ async fn allow_override_by_type_async() {
 
     let mut cx = Context::create(modules![Module1, Module2]);
     // Component1, Component2, Rc<dyn Trait1>
-    assert_eq!(cx.provider_registry().len(), 3);
+    assert_eq!(cx.provider_registry_len(), 3);
 
     let instance = cx.resolve_async::<Rc<dyn Trait1>>().await;
     assert!(instance.as_any().is::<Component1>());
@@ -127,7 +127,7 @@ async fn allow_override_by_name_async() {
 
     let mut cx = Context::create(modules![Module1, Module2]);
     // Component1, Component2, Rc<dyn Trait1>
-    assert_eq!(cx.provider_registry().len(), 3);
+    assert_eq!(cx.provider_registry_len(), 3);
 
     let instance = cx.resolve_with_name_async::<Rc<dyn Trait1>>("hello").await;
     assert!(instance.as_any().is::<Component1>());

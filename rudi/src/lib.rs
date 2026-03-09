@@ -6,6 +6,7 @@
 mod auto_register;
 mod context;
 mod definition;
+mod error;
 mod future;
 mod macros;
 mod module;
@@ -22,5 +23,8 @@ pub use rudi_macro::*;
 #[cfg_attr(docsrs, doc(cfg(feature = "auto-register")))]
 #[cfg(feature = "auto-register")]
 pub use self::auto_register::*;
+pub use self::registry::ProviderEntry;
 pub(crate) use self::registry::*;
-pub use self::{context::*, definition::*, future::*, module::*, provider::*, single::*, ty::*};
+pub use self::{
+    context::*, definition::*, error::*, future::*, module::*, provider::*, single::*, ty::*,
+};

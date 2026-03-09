@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["rudi", "rudi-core", "rudi-macro", "examples/*"]
+members = ["rudi", "rudi-core", "rudi-macro", "from-attr", "from-attr-core", "from-attr-macro", "examples/*"]
 
 [workspace.package]
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 authors = ["zihan <ZihanType@proton.me>"]
 license = "MIT/Apache-2.0"
@@ -14,15 +14,18 @@ readme = "README.md"
 
 [workspace.dependencies]
 # self
-rudi = { version = "0.8.3", path = "./rudi", default-features = false }
-rudi-macro = { version = "0.8.3", path = "./rudi-macro", default-features = false }
-rudi-core = { version = "0.1.0", path = "./rudi-core", default-features = false }
+rudi = { version = "0.9.0", path = "./rudi", default-features = false }
+rudi-macro = { version = "0.9.0", path = "./rudi-macro", default-features = false }
+rudi-core = { version = "0.9.0", path = "./rudi-core", default-features = false }
 
 # dependencies
 proc-macro2 = { version = "1", default-features = false }
 quote = { version = "1", default-features = false }
 syn = { version = "2", default-features = false }
-from-attr = { version = "0.1", default-features = false }
+from-attr = { path = "./from-attr", default-features = false }
+from-attr-core = { path = "./from-attr-core", default-features = false }
+from-attr-macro = { path = "./from-attr-macro", default-features = false }
+quote-use = { version = "0.8", default-features = false }
 
 # optional dependencies
 inventory = { version = "0.3", default-features = false }
@@ -36,13 +39,13 @@ tokio = { version = "1", default-features = false, features = [
 async-trait = { version = "0.1", default-features = false }
 poem = { version = "3", default-features = false }
 poem-openapi = { version = "5", default-features = false }
-axum = { version = "0.7", default-features = false }
+axum = { version = "0.8", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "ansi",
     "env-filter",
 ] }
-leptos = { version = "0.7", default-features = false }
+leptos = { version = "0.8", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

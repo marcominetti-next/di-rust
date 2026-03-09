@@ -1,8 +1,8 @@
-use std::{any::TypeId, borrow::Cow, collections::HashMap, rc::Rc};
+use std::{any::TypeId, borrow::Cow, collections::{HashMap, HashSet, VecDeque}, rc::Rc};
 
 use crate::{
     BoxFuture, Constructor, Definition, DynProvider, DynSingle, EagerCreateFunction, Key, Provider,
-    ProviderRegistry, ResolveModule, Scope, Single, SingleRegistry, Type,
+    ProviderEntry, ResolveError, ResolveModule, Scope, Single, UnifiedRegistry, Type,
 };
 
 /// A context is a container for all the providers and instances.
@@ -112,10 +112,9 @@ pub struct Context {
 
     eager_create: bool,
 
-    single_registry: SingleRegistry,
-    provider_registry: ProviderRegistry,
+    registry: UnifiedRegistry,
 
-    loaded_modules: Vec<Type>,
+    loaded_modules: HashSet<Type>,
     conditional_providers: Vec<(bool, DynProvider)>,
     eager_create_functions: Vec<(Definition, EagerCreateFunction)>,
 
@@ -128,8 +127,7 @@ impl Default for Context {
             allow_override: true,
             allow_only_single_eager_create: true,
             eager_create: Default::default(),
-            single_registry: Default::default(),
-            provider_registry: Default::default(),
+            registry: Default::default(),
             loaded_modules: Default::default(),
             conditional_providers: Default::default(),
             eager_create_functions: Default::default(),
@@ -271,18 +269,39 @@ impl Context {
         self.eager_create
     }
 
-    /// Returns a reference to the single registry.
-    pub fn single_registry(&self) -> &HashMap<Key, DynSingle> {
-        self.single_registry.inner()
+    /// Returns the number of registered singleton/single-owner instances.
+    pub fn single_registry_len(&self) -> usize {
+        self.registry
+            .entries()
+            .values()
+            .filter(|e| matches!(e, ProviderEntry::WithInstance(_, _)))
+            .count()
     }
 
-    /// Returns a reference to the provider registry.
-    pub fn provider_registry(&self) -> &HashMap<Key, DynProvider> {
-        self.provider_registry.inner()
+    /// Returns true if no singleton/single-owner instances are registered.
+    pub fn single_registry_is_empty(&self) -> bool {
+        self.single_registry_len() == 0
+    }
+
+    /// Returns the number of registered providers.
+    pub fn provider_registry_len(&self) -> usize {
+        self.registry.entries().len()
+    }
+
+    /// Returns true if no providers are registered.
+    pub fn provider_registry_is_empty(&self) -> bool {
+        self.registry.entries().is_empty()
+    }
+
+    /// Returns a reference to the unified registry entries.
+    ///
+    /// Each entry contains a provider and optionally a cached singleton instance.
+    pub fn registry_entries(&self) -> &HashMap<Key, ProviderEntry> {
+        self.registry.entries()
     }
 
     /// Returns a reference to the loaded modules.
-    pub fn loaded_modules(&self) -> &Vec<Type> {
+    pub fn loaded_modules(&self) -> &HashSet<Type> {
         &self.loaded_modules
     }
 
@@ -357,9 +376,8 @@ impl Context {
             Provider::<T>::never_construct(name.into(), Scope::Singleton).into();
         let single = Single::new(instance, Some(Clone::clone)).into();
 
-        let key = provider.key().clone();
-        self.provider_registry.insert(provider, self.allow_override);
-        self.single_registry.insert(key, single);
+        self.registry
+            .insert_with_instance(provider, single, self.allow_override);
     }
 
     /// Appends a standalone [`SingleOwner`](crate::Scope::SingleOwner) instance to the context with default name `""`.
@@ -424,9 +442,8 @@ impl Context {
             Provider::<T>::never_construct(name.into(), Scope::SingleOwner).into();
         let single = Single::new(instance, None).into();
 
-        let key = provider.key().clone();
-        self.provider_registry.insert(provider, self.allow_override);
-        self.single_registry.insert(key, single);
+        self.registry
+            .insert_with_instance(provider, single, self.allow_override);
     }
 
     /// Load the given modules.
@@ -467,7 +484,7 @@ impl Context {
         let modules = flatten(modules, ResolveModule::submodules);
 
         modules.into_iter().for_each(|module| {
-            self.loaded_modules.push(module.ty());
+            self.loaded_modules.insert(module.ty());
             self.load_providers(module.eager_create(), module.providers());
         });
     }
@@ -506,7 +523,7 @@ impl Context {
         let modules = flatten(modules, ResolveModule::submodules);
 
         modules.into_iter().for_each(|module| {
-            self.loaded_modules.retain(|ty| ty != &module.ty());
+            self.loaded_modules.remove(&module.ty());
             self.unload_providers(module.providers());
         });
     }
@@ -680,7 +697,7 @@ impl Context {
     /// ```
     #[track_caller]
     pub fn resolve<T: 'static>(&mut self) -> T {
-        self.resolve_with_name("")
+        self.try_resolve().unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Returns a [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance based on the given type and name.
@@ -709,14 +726,8 @@ impl Context {
     /// ```
     #[track_caller]
     pub fn resolve_with_name<T: 'static>(&mut self, name: impl Into<Cow<'static, str>>) -> T {
-        match self.inner_resolve(name.into(), Behaviour::CreateThenReturnSingletonOrTransient) {
-            Resolved::SingletonOrTransient(instance) => instance,
-            Resolved::NotFoundProvider(key) => no_provider_panic(key),
-            Resolved::NotSingletonOrTransient(definition) => {
-                not_singleton_or_transient_panic(definition)
-            }
-            Resolved::NotSingletonOrSingleOwner(_) | Resolved::NoReturn => unreachable!(),
-        }
+        self.try_resolve_with_name(name)
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Returns an optional [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance based on the given type and default name `""`.
@@ -747,7 +758,8 @@ impl Context {
     /// ```
     #[track_caller]
     pub fn resolve_option<T: 'static>(&mut self) -> Option<T> {
-        self.resolve_option_with_name("")
+        self.try_resolve_option()
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Returns an optional [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance based on the given type and name.
@@ -781,9 +793,81 @@ impl Context {
         &mut self,
         name: impl Into<Cow<'static, str>>,
     ) -> Option<T> {
-        match self.inner_resolve(name.into(), Behaviour::CreateThenReturnSingletonOrTransient) {
-            Resolved::SingletonOrTransient(instance) => Some(instance),
-            Resolved::NotFoundProvider(_) | Resolved::NotSingletonOrTransient(_) => None,
+        self.try_resolve_option_with_name(name)
+            .unwrap_or_else(|e| panic!("{}", e))
+    }
+
+    /// Returns a [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance,
+    /// or a [`ResolveError`] if resolution fails.
+    ///
+    /// This is the non-panicking version of [`Context::resolve`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::NoProvider`] if no provider is registered for the given type and default name `""`.
+    /// - [`ResolveError::AsyncInSyncContext`] if the provider's constructor is async.
+    /// - [`ResolveError::NotSingletonOrTransient`] if the provider is not Singleton or Transient.
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub fn try_resolve<T: 'static>(&mut self) -> Result<T, ResolveError> {
+        self.try_resolve_with_name("")
+    }
+
+    /// Returns a [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance with the given name,
+    /// or a [`ResolveError`] if resolution fails.
+    ///
+    /// This is the non-panicking version of [`Context::resolve_with_name`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::NoProvider`] if no provider is registered for the given type and name.
+    /// - [`ResolveError::AsyncInSyncContext`] if the provider's constructor is async.
+    /// - [`ResolveError::NotSingletonOrTransient`] if the provider is not Singleton or Transient.
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub fn try_resolve_with_name<T: 'static>(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Result<T, ResolveError> {
+        match self.try_inner_resolve(name.into(), Behaviour::CreateThenReturnSingletonOrTransient)? {
+            Resolved::SingletonOrTransient(instance) => Ok(instance),
+            Resolved::NotFoundProvider(key) => Err(ResolveError::NoProvider(key)),
+            Resolved::NotSingletonOrTransient(definition) => {
+                Err(ResolveError::NotSingletonOrTransient(definition))
+            }
+            Resolved::NotSingletonOrSingleOwner(_) | Resolved::NoReturn => unreachable!(),
+        }
+    }
+
+    /// Returns an optional [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance,
+    /// or a [`ResolveError`] if resolution fails due to async/circular issues.
+    ///
+    /// This is the non-panicking version of [`Context::resolve_option`].
+    /// Returns `Ok(None)` if no provider is found or the provider is not Singleton/Transient.
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::AsyncInSyncContext`] if the provider's constructor is async.
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub fn try_resolve_option<T: 'static>(&mut self) -> Result<Option<T>, ResolveError> {
+        self.try_resolve_option_with_name("")
+    }
+
+    /// Returns an optional [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance with the given name,
+    /// or a [`ResolveError`] if resolution fails due to async/circular issues.
+    ///
+    /// This is the non-panicking version of [`Context::resolve_option_with_name`].
+    /// Returns `Ok(None)` if no provider is found or the provider is not Singleton/Transient.
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::AsyncInSyncContext`] if the provider's constructor is async.
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub fn try_resolve_option_with_name<T: 'static>(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Result<Option<T>, ResolveError> {
+        match self.try_inner_resolve(name.into(), Behaviour::CreateThenReturnSingletonOrTransient)? {
+            Resolved::SingletonOrTransient(instance) => Ok(Some(instance)),
+            Resolved::NotFoundProvider(_) | Resolved::NotSingletonOrTransient(_) => Ok(None),
             Resolved::NotSingletonOrSingleOwner(_) | Resolved::NoReturn => unreachable!(),
         }
     }
@@ -1081,7 +1165,9 @@ impl Context {
     /// }
     /// ```
     pub async fn resolve_async<T: 'static>(&mut self) -> T {
-        self.resolve_with_name_async("").await
+        self.try_resolve_async()
+            .await
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Async version of [`Context::resolve_with_name`].
@@ -1116,17 +1202,9 @@ impl Context {
         &mut self,
         name: impl Into<Cow<'static, str>>,
     ) -> T {
-        match self
-            .inner_resolve_async(name.into(), Behaviour::CreateThenReturnSingletonOrTransient)
+        self.try_resolve_with_name_async(name)
             .await
-        {
-            Resolved::SingletonOrTransient(instance) => instance,
-            Resolved::NotFoundProvider(key) => no_provider_panic(key),
-            Resolved::NotSingletonOrTransient(definition) => {
-                not_singleton_or_transient_panic(definition)
-            }
-            Resolved::NotSingletonOrSingleOwner(_) | Resolved::NoReturn => unreachable!(),
-        }
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Async version of [`Context::resolve_option`].
@@ -1156,7 +1234,9 @@ impl Context {
     /// }
     /// ```
     pub async fn resolve_option_async<T: 'static>(&mut self) -> Option<T> {
-        self.resolve_option_with_name_async("").await
+        self.try_resolve_option_async()
+            .await
+            .unwrap_or_else(|e| panic!("{}", e))
     }
 
     /// Async version of [`Context::resolve_option_with_name`].
@@ -1189,12 +1269,75 @@ impl Context {
         &mut self,
         name: impl Into<Cow<'static, str>>,
     ) -> Option<T> {
-        match self
-            .inner_resolve_async(name.into(), Behaviour::CreateThenReturnSingletonOrTransient)
+        self.try_resolve_option_with_name_async(name)
             .await
+            .unwrap_or_else(|e| panic!("{}", e))
+    }
+
+    /// Async version of [`Context::try_resolve`].
+    ///
+    /// Returns a [`Singleton`](crate::Scope::Singleton) or [`Transient`](crate::Scope::Transient) instance,
+    /// or a [`ResolveError`] if resolution fails.
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::NoProvider`] if no provider is registered for the given type and default name `""`.
+    /// - [`ResolveError::NotSingletonOrTransient`] if the provider is not Singleton or Transient.
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub async fn try_resolve_async<T: 'static>(&mut self) -> Result<T, ResolveError> {
+        self.try_resolve_with_name_async("").await
+    }
+
+    /// Async version of [`Context::try_resolve_with_name`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::NoProvider`] if no provider is registered for the given type and name.
+    /// - [`ResolveError::NotSingletonOrTransient`] if the provider is not Singleton or Transient.
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub async fn try_resolve_with_name_async<T: 'static>(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Result<T, ResolveError> {
+        match self
+            .try_inner_resolve_async(name.into(), Behaviour::CreateThenReturnSingletonOrTransient)
+            .await?
         {
-            Resolved::SingletonOrTransient(instance) => Some(instance),
-            Resolved::NotFoundProvider(_) | Resolved::NotSingletonOrTransient(_) => None,
+            Resolved::SingletonOrTransient(instance) => Ok(instance),
+            Resolved::NotFoundProvider(key) => Err(ResolveError::NoProvider(key)),
+            Resolved::NotSingletonOrTransient(definition) => {
+                Err(ResolveError::NotSingletonOrTransient(definition))
+            }
+            Resolved::NotSingletonOrSingleOwner(_) | Resolved::NoReturn => unreachable!(),
+        }
+    }
+
+    /// Async version of [`Context::try_resolve_option`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub async fn try_resolve_option_async<T: 'static>(
+        &mut self,
+    ) -> Result<Option<T>, ResolveError> {
+        self.try_resolve_option_with_name_async("").await
+    }
+
+    /// Async version of [`Context::try_resolve_option_with_name`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveError::CircularDependency`] if a circular dependency is detected.
+    pub async fn try_resolve_option_with_name_async<T: 'static>(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Result<Option<T>, ResolveError> {
+        match self
+            .try_inner_resolve_async(name.into(), Behaviour::CreateThenReturnSingletonOrTransient)
+            .await?
+        {
+            Resolved::SingletonOrTransient(instance) => Ok(Some(instance)),
+            Resolved::NotFoundProvider(_) | Resolved::NotSingletonOrTransient(_) => Ok(None),
             Resolved::NotSingletonOrSingleOwner(_) | Resolved::NoReturn => unreachable!(),
         }
     }
@@ -1507,7 +1650,7 @@ impl Context {
         name: impl Into<Cow<'static, str>>,
     ) -> bool {
         let key = Key::new::<T>(name.into());
-        self.provider_registry.contains(&key)
+        self.registry.contains_provider(&key)
     }
 
     /// Returns a reference to an provider based on the given type and default name `""`.
@@ -1549,7 +1692,7 @@ impl Context {
         name: impl Into<Cow<'static, str>>,
     ) -> Option<&Provider<T>> {
         let key = Key::new::<T>(name.into());
-        self.provider_registry.get(&key)
+        self.registry.get_provider(&key)
     }
 
     /// Returns a collection of references to providers based on the given type.
@@ -1577,10 +1720,13 @@ impl Context {
     pub fn get_providers_by_type<T: 'static>(&self) -> Vec<&Provider<T>> {
         let type_id = TypeId::of::<T>();
 
-        self.provider_registry()
+        self.registry
+            .names_by_type(type_id)
             .iter()
-            .filter(|(key, _)| key.ty.id == type_id)
-            .filter_map(|(_, provider)| provider.as_provider())
+            .filter_map(|name| {
+                let key = Key::new::<T>(name.clone());
+                self.registry.get_provider::<T>(&key)
+            })
             .collect()
     }
 
@@ -1625,7 +1771,7 @@ impl Context {
         name: impl Into<Cow<'static, str>>,
     ) -> bool {
         let key = Key::new::<T>(name.into());
-        self.single_registry.contains(&key)
+        self.registry.contains_instance(&key)
     }
 
     /// Returns a reference to a [`Singleton`](crate::Scope::Singleton) or [`SingleOwner`](crate::Scope::SingleOwner) instance based on the given type and default name `""`.
@@ -1678,8 +1824,8 @@ impl Context {
     #[track_caller]
     pub fn get_single_with_name<T: 'static>(&self, name: impl Into<Cow<'static, str>>) -> &T {
         let key = Key::new::<T>(name.into());
-        self.single_registry
-            .get_ref(&key)
+        self.registry
+            .get_single_ref(&key)
             .unwrap_or_else(|| panic!("no instance registered for: {:?}", key))
     }
 
@@ -1724,7 +1870,7 @@ impl Context {
         name: impl Into<Cow<'static, str>>,
     ) -> Option<&T> {
         let key = Key::new::<T>(name.into());
-        self.single_registry.get_ref(&key)
+        self.registry.get_single_ref(&key)
     }
 
     /// Returns a collection of references to [`Singleton`](crate::Scope::Singleton) and [`SingleOwner`](crate::Scope::SingleOwner) instances based on the given type.
@@ -1752,11 +1898,13 @@ impl Context {
     pub fn get_singles_by_type<T: 'static>(&self) -> Vec<&T> {
         let type_id = TypeId::of::<T>();
 
-        self.single_registry()
+        self.registry
+            .names_by_type(type_id)
             .iter()
-            .filter(|(key, _)| key.ty.id == type_id)
-            .filter_map(|(_, instance)| instance.as_single())
-            .map(|instance| instance.get_ref())
+            .filter_map(|name| {
+                let key = Key::new::<T>(name.clone());
+                self.registry.get_single_ref::<T>(&key)
+            })
             .collect()
     }
 }
@@ -1781,7 +1929,7 @@ impl Context {
                 .push((definition.clone(), provider.eager_create_function()));
         }
 
-        self.provider_registry.insert(provider, self.allow_override);
+        self.registry.insert_provider(provider, self.allow_override);
     }
 
     #[track_caller]
@@ -1791,6 +1939,8 @@ impl Context {
         }
 
         let providers = flatten(providers, DynProvider::binding_providers);
+
+        self.registry.reserve(providers.len());
 
         providers.into_iter().for_each(|provider| {
             if provider.condition().is_some() {
@@ -1811,8 +1961,7 @@ impl Context {
 
         providers.into_iter().for_each(|provider| {
             let key = provider.key();
-            self.provider_registry.remove(key);
-            self.single_registry.remove(key);
+            self.registry.remove(key);
         });
     }
 
@@ -1894,44 +2043,58 @@ please use instead:
     ) -> Result<Resolved<T>, Holder<'_, T>> {
         let key = Key::new::<T>(name);
 
-        let Some(provider) = self.provider_registry.get::<T>(&key) else {
+        // Single HashMap lookup for both provider and cached instance
+        let Some(entry) = self.registry.get_entry(&key) else {
             return Ok(Resolved::NotFoundProvider(key));
         };
 
-        let definition = provider.definition();
+        match entry {
+            ProviderEntry::WithInstance(dyn_provider, dyn_single) => {
+                // Singleton/SingleOwner with cached instance
+                let provider = dyn_provider
+                    .as_provider::<T>()
+                    .expect("type mismatch in registry");
+                let definition = provider.definition();
 
-        if self.single_registry.contains(&key) {
-            return Ok(match behaviour {
-                Behaviour::CreateThenReturnSingletonOrTransient => {
-                    match self.single_registry.get_owned::<T>(&key) {
-                        Some(instance) => Resolved::SingletonOrTransient(instance),
-                        None => Resolved::NotSingletonOrTransient(definition.clone()),
+                Ok(match behaviour {
+                    Behaviour::CreateThenReturnSingletonOrTransient => {
+                        match dyn_single.as_single::<T>().and_then(|s| s.get_owned()) {
+                            Some(instance) => Resolved::SingletonOrTransient(instance),
+                            None => Resolved::NotSingletonOrTransient(definition.clone()),
+                        }
                     }
+                    Behaviour::JustCreateAllScopeForEagerCreate
+                    | Behaviour::JustCreateSingletonOrSingleOwner => Resolved::NoReturn,
+                })
+            }
+            ProviderEntry::Provider(dyn_provider) => {
+                // No cached instance yet
+                let provider = dyn_provider
+                    .as_provider::<T>()
+                    .expect("type mismatch in registry");
+                let definition = provider.definition();
+
+                match (definition.scope, behaviour) {
+                    (Scope::Transient, Behaviour::JustCreateSingletonOrSingleOwner) => {
+                        return Ok(Resolved::NotSingletonOrSingleOwner(definition.clone()))
+                    }
+                    (Scope::SingleOwner, Behaviour::CreateThenReturnSingletonOrTransient) => {
+                        return Ok(Resolved::NotSingletonOrTransient(definition.clone()))
+                    }
+                    _ => {}
                 }
-                Behaviour::JustCreateAllScopeForEagerCreate
-                | Behaviour::JustCreateSingletonOrSingleOwner => Resolved::NoReturn,
-            });
-        }
 
-        match (definition.scope, behaviour) {
-            (Scope::Transient, Behaviour::JustCreateSingletonOrSingleOwner) => {
-                return Ok(Resolved::NotSingletonOrSingleOwner(definition.clone()))
+                let constructor = provider.constructor().expect(NO_CONSTRUCTOR_MSG);
+                let clone_instance = provider.clone_instance();
+
+                Err(Holder {
+                    key,
+                    constructor,
+                    clone_instance,
+                    definition,
+                })
             }
-            (Scope::SingleOwner, Behaviour::CreateThenReturnSingletonOrTransient) => {
-                return Ok(Resolved::NotSingletonOrTransient(definition.clone()))
-            }
-            _ => {}
         }
-
-        let constructor = provider.constructor();
-        let clone_instance = provider.clone_instance();
-
-        Err(Holder {
-            key,
-            constructor,
-            clone_instance,
-            definition,
-        })
     }
 
     fn after_resolve<T: 'static>(
@@ -1945,7 +2108,7 @@ please use instead:
         match (scope, behaviour) {
             // Singleton
             (Scope::Singleton, Behaviour::CreateThenReturnSingletonOrTransient) => {
-                self.single_registry.insert(
+                self.registry.set_instance(
                     key,
                     Single::new((clone_instance.unwrap())(&instance), clone_instance).into(),
                 );
@@ -1954,8 +2117,8 @@ please use instead:
             }
             (Scope::Singleton, Behaviour::JustCreateAllScopeForEagerCreate)
             | (Scope::Singleton, Behaviour::JustCreateSingletonOrSingleOwner) => {
-                self.single_registry
-                    .insert(key, Single::new(instance, clone_instance).into());
+                self.registry
+                    .set_instance(key, Single::new(instance, clone_instance).into());
 
                 Resolved::NoReturn
             }
@@ -1969,8 +2132,8 @@ please use instead:
             (Scope::SingleOwner, Behaviour::CreateThenReturnSingletonOrTransient) => unreachable!(),
             (Scope::SingleOwner, Behaviour::JustCreateAllScopeForEagerCreate)
             | (Scope::SingleOwner, Behaviour::JustCreateSingletonOrSingleOwner) => {
-                self.single_registry
-                    .insert(key, Single::new(instance, None).into());
+                self.registry
+                    .set_instance(key, Single::new(instance, None).into());
 
                 Resolved::NoReturn
             }
@@ -2009,7 +2172,6 @@ please check all the references to the above type, there are 3 scenarios that wi
                 )
             }
             Constructor::Sync(constructor) => self.resolve_instance(key.clone(), constructor),
-            Constructor::None => unreachable!(),
         };
 
         self.after_resolve(key, behaviour, scope, instance, clone_instance)
@@ -2040,7 +2202,6 @@ please check all the references to the above type, there are 3 scenarios that wi
                     self.resolve_instance_async(key, constructor).await
                 }
                 Constructor::Sync(constructor) => self.resolve_instance(key, constructor),
-                Constructor::None => unreachable!(),
             }
         };
 
@@ -2071,14 +2232,96 @@ please check all the references to the above type, there are 3 scenarios that wi
         instance
     }
 
-    fn names<T: 'static>(&self) -> Vec<Cow<'static, str>> {
-        let type_id = TypeId::of::<T>();
+    fn try_resolve_instance<T: 'static>(
+        &mut self,
+        key: Key,
+        constructor: Rc<dyn Fn(&mut Context) -> T>,
+    ) -> Result<T, ResolveError> {
+        self.dependency_chain.try_push(key)?;
+        let instance = constructor(self);
+        self.dependency_chain.pop();
+        Ok(instance)
+    }
 
-        self.provider_registry()
-            .keys()
-            .filter(|&key| key.ty.id == type_id)
-            .map(|key| key.name.clone())
-            .collect()
+    #[allow(clippy::type_complexity)]
+    async fn try_resolve_instance_async<T: 'static>(
+        &mut self,
+        key: Key,
+        constructor: Rc<dyn for<'a> Fn(&'a mut Context) -> BoxFuture<'a, T>>,
+    ) -> Result<T, ResolveError> {
+        self.dependency_chain.try_push(key)?;
+        let instance = constructor(self).await;
+        self.dependency_chain.pop();
+        Ok(instance)
+    }
+
+    fn try_inner_resolve<T: 'static>(
+        &mut self,
+        name: Cow<'static, str>,
+        behaviour: Behaviour,
+    ) -> Result<Resolved<T>, ResolveError> {
+        let Holder {
+            key,
+            constructor,
+            clone_instance,
+            definition,
+        } = match self.before_resolve(name, behaviour) {
+            Ok(o) => return Ok(o),
+            Err(e) => e,
+        };
+
+        let scope = definition.scope;
+
+        let instance = match constructor {
+            Constructor::Async(_) => {
+                return Err(ResolveError::AsyncInSyncContext(definition.clone()));
+            }
+            Constructor::Sync(constructor) => {
+                self.try_resolve_instance(key.clone(), constructor)?
+            }
+        };
+
+        Ok(self.after_resolve(key, behaviour, scope, instance, clone_instance))
+    }
+
+    async fn try_inner_resolve_async<T: 'static>(
+        &mut self,
+        name: Cow<'static, str>,
+        behaviour: Behaviour,
+    ) -> Result<Resolved<T>, ResolveError> {
+        let Holder {
+            key,
+            constructor,
+            clone_instance,
+            definition,
+        } = match self.before_resolve(name, behaviour) {
+            Ok(o) => return Ok(o),
+            Err(e) => e,
+        };
+
+        let scope = definition.scope;
+
+        let instance = {
+            let key_clone = key.clone();
+
+            match constructor {
+                Constructor::Async(constructor) => {
+                    self.try_resolve_instance_async(key_clone, constructor)
+                        .await?
+                }
+                Constructor::Sync(constructor) => {
+                    self.try_resolve_instance(key_clone, constructor)?
+                }
+            }
+        };
+
+        Ok(self.after_resolve(key, behaviour, scope, instance, clone_instance))
+    }
+
+    fn names<T: 'static>(&self) -> Vec<Cow<'static, str>> {
+        self.registry
+            .names_by_type(TypeId::of::<T>())
+            .to_vec()
     }
 }
 
@@ -2107,6 +2350,11 @@ struct Holder<'a, T> {
     definition: &'a Definition,
 }
 
+/// Message for unreachable state when a provider has no constructor.
+/// This can only happen if a never_construct provider's instance is missing from single_registry.
+const NO_CONSTRUCTOR_MSG: &str =
+    "provider has no constructor (never_construct provider with missing instance)";
+
 #[inline(always)]
 fn no_provider_panic(key: Key) -> ! {
     panic!("no provider registered for: {:?}", key)
@@ -2120,31 +2368,22 @@ fn not_singleton_or_single_owner_panic(definition: Definition) -> ! {
     )
 }
 
-#[inline(always)]
-fn not_singleton_or_transient_panic(definition: Definition) -> ! {
-    panic!(
-        "registered provider is not `Singleton` or `Transient` for: {:?}",
-        definition
-    )
-}
-
-fn flatten<T, F>(mut unresolved: Vec<T>, get_sublist: F) -> Vec<T>
+fn flatten<T, F>(unresolved: Vec<T>, get_sublist: F) -> Vec<T>
 where
     F: Fn(&mut T) -> Option<Vec<T>>,
 {
     debug_assert!(!unresolved.is_empty());
 
     let mut resolved = Vec::with_capacity(unresolved.len());
+    let mut queue = VecDeque::from(unresolved);
 
-    unresolved.reverse();
-
-    while let Some(mut element) = unresolved.pop() {
-        match get_sublist(&mut element) {
-            Some(mut sublist) if !sublist.is_empty() => {
-                sublist.reverse();
-                unresolved.append(&mut sublist);
+    while let Some(mut element) = queue.pop_front() {
+        if let Some(sublist) = get_sublist(&mut element) {
+            // Insert children at the front so they are processed immediately
+            // after their parent (DFS pre-order), preserving child order.
+            for (i, child) in sublist.into_iter().enumerate() {
+                queue.insert(i, child);
             }
-            _ => {}
         }
 
         resolved.push(element);
@@ -2418,10 +2657,12 @@ impl ContextOptions {
             singles,
         } = self;
 
+        let initial_capacity = providers.len();
         let mut cx = Context {
             allow_override,
             allow_only_single_eager_create,
             eager_create,
+            registry: UnifiedRegistry::with_capacity(initial_capacity),
             ..Default::default()
         };
 
@@ -2430,9 +2671,8 @@ impl ContextOptions {
                 .into_iter()
                 .zip(singles)
                 .for_each(|(provider, single)| {
-                    let key = provider.key().clone();
-                    cx.provider_registry.insert(provider, allow_override);
-                    cx.single_registry.insert(key, single);
+                    cx.registry
+                        .insert_with_instance(provider, single, allow_override);
                 });
         }
 
@@ -2453,7 +2693,7 @@ impl ContextOptions {
 
         self.inner_create(|cx| {
             let module = ResolveModule::new::<AutoRegisterModule>();
-            cx.loaded_modules.push(module.ty());
+            cx.loaded_modules.insert(module.ty());
             cx.load_providers(module.eager_create(), module.providers())
         })
     }
@@ -2556,12 +2796,14 @@ impl ContextOptions {
 #[derive(Default)]
 struct DependencyChain {
     stack: Vec<Key>,
+    seen: HashSet<Key>,
 }
 
 impl DependencyChain {
-    fn push(&mut self, key: Key) {
-        let already_contains = self.stack.contains(&key);
-        self.stack.push(key);
+    fn try_push(&mut self, key: Key) -> Result<(), ResolveError> {
+        let already_contains = self.seen.contains(&key);
+        self.stack.push(key.clone());
+        self.seen.insert(key);
 
         if already_contains {
             let key = self.stack.last().unwrap();
@@ -2583,11 +2825,21 @@ impl DependencyChain {
 
             buf.push(']');
 
-            panic!("circular dependency detected: {}", buf);
+            return Err(ResolveError::CircularDependency(buf));
         }
+
+        Ok(())
+    }
+
+    #[track_caller]
+    fn push(&mut self, key: Key) {
+        self.try_push(key)
+            .unwrap_or_else(|e| panic!("{}", e));
     }
 
     fn pop(&mut self) {
-        self.stack.pop();
+        if let Some(key) = self.stack.pop() {
+            self.seen.remove(&key);
+        }
     }
 }

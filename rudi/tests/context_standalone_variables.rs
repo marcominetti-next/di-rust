@@ -1,4 +1,4 @@
-use rudi::{modules, Context, Scope};
+use rudi::{modules, Context, ProviderEntry, Scope};
 
 #[test]
 fn standalone_variables() {
@@ -10,15 +10,18 @@ fn standalone_variables() {
                 .$method("Hello world")
                 .create(modules![]);
 
-            assert_eq!(cx.single_registry().len(), 3);
+            assert_eq!(cx.single_registry_len(), 3);
 
             assert_eq!(cx.get_single::<i32>(), &42);
             assert!(*cx.get_single::<bool>());
             assert_eq!(cx.get_single::<&str>(), &"Hello world");
 
-            assert_eq!(cx.single_registry().len(), 3);
+            assert_eq!(cx.single_registry_len(), 3);
 
-            cx.provider_registry().iter().for_each(|(_, provider)| {
+            cx.registry_entries().iter().for_each(|(_, entry)| {
+                let provider = match entry {
+                    ProviderEntry::Provider(p) | ProviderEntry::WithInstance(p, _) => p,
+                };
                 assert!(provider.definition().scope == Scope::$variant);
                 assert!(!provider.eager_create());
             });

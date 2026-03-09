@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use axum::{
-    async_trait,
     extract::{Path, State},
     routing::{delete, get, post},
     Router,
@@ -10,26 +9,18 @@ use rudi::{Context, Singleton};
 use tokio::{net::TcpListener, sync::Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[async_trait]
 trait Service: Send + Sync {
-    async fn insert(&self, name: String);
-    async fn search(&self, name: &str) -> Option<String>;
-    async fn delete(&self, name: &str);
+    fn insert(&self, name: String) -> impl std::future::Future<Output = ()> + Send;
+    fn search(&self, name: &str) -> impl std::future::Future<Output = Option<String>> + Send;
+    fn delete(&self, name: &str) -> impl std::future::Future<Output = ()> + Send;
 }
 
 #[derive(Clone)]
-#[Singleton(binds = [Self::into_service])]
+#[Singleton]
 struct ServiceImpl {
     db: Arc<Mutex<Vec<String>>>,
 }
 
-impl ServiceImpl {
-    fn into_service(self) -> Arc<dyn Service> {
-        Arc::new(self)
-    }
-}
-
-#[async_trait]
 impl Service for ServiceImpl {
     async fn insert(&self, name: String) {
         self.db.lock().await.push(name);
@@ -49,15 +40,15 @@ impl Service for ServiceImpl {
     }
 }
 
-async fn insert(Path(name): Path<String>, State(svc): State<Arc<dyn Service>>) {
+async fn insert(Path(name): Path<String>, State(svc): State<ServiceImpl>) {
     svc.insert(name).await;
 }
 
-async fn search(Path(name): Path<String>, State(svc): State<Arc<dyn Service>>) -> String {
+async fn search(Path(name): Path<String>, State(svc): State<ServiceImpl>) -> String {
     svc.search(&name).await.unwrap_or("".to_string())
 }
 
-async fn del(Path(name): Path<String>, State(svc): State<Arc<dyn Service>>) {
+async fn del(Path(name): Path<String>, State(svc): State<ServiceImpl>) {
     svc.delete(&name).await;
 }
 
@@ -67,11 +58,11 @@ fn EmptyVec() -> Arc<Mutex<Vec<String>>> {
 }
 
 #[Singleton]
-async fn Run(svc: Arc<dyn Service>) {
+async fn Run(svc: ServiceImpl) {
     let app = Router::new()
-        .route("/insert/:name", post(insert))
-        .route("/search/:name", get(search))
-        .route("/delete/:name", delete(del))
+        .route("/insert/{name}", post(insert))
+        .route("/search/{name}", get(search))
+        .route("/delete/{name}", delete(del))
         .with_state(svc);
 
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
