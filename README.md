@@ -1,151 +1,125 @@
 # Rudi
 
-[![Crates.io version](https://img.shields.io/crates/v/rudi.svg?style=flat-square)](https://crates.io/crates/rudi)
-[![docs.rs docs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/rudi)
+Rudi is an out-of-the-box dependency injection framework for Rust, providing compile-time macro generation and runtime dependency resolution.
 
-English | [简体中文](./README-zh_cn.md)
+## Capabilities
 
-Rudi - an out-of-the-box dependency injection framework for Rust.
+- Three provider scopes: Singleton (cached, cloneable), Transient (fresh per resolve), and SingleOwner (cached, reference-only)
+- Attribute macros (`#[Singleton]`, `#[Transient]`, `#[SingleOwner]`) for struct, enum, impl block, and function targets
+- Automatic provider registration across compilation units via the `inventory` crate
+- Synchronous and asynchronous constructor support with full async resolution API
+- Module system for organizing providers with hierarchical submodule support
+- Type bindings for registering trait object providers from concrete implementations
+- Conditional provider registration based on runtime context state
+- Named providers for disambiguating multiple instances of the same type
+
+## Quick Start
+
+1. Add `rudi` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rudi = "0.9"
+```
+
+2. Annotate your types with scope macros:
 
 ```rust
 use rudi::{Context, Singleton, Transient};
 
-// Register `fn(cx) -> A { A }` as the constructor for `A`
-#[derive(Debug)]
-#[Transient]
-struct A;
-
-#[derive(Debug)]
-struct B(A);
-
-// Register `fn(cx) -> B { B::new(cx.resolve::<A>()) }` as the constructor for `B`
-#[Transient]
-impl B {
-    #[di]
-    fn new(a: A) -> B {
-        B(a)
-    }
-}
-
-// Register `fn(cx) -> C { C::B(cx.resolve::<B>()) }` as the constructor for `C`
-#[allow(dead_code)]
-#[Transient]
-enum C {
-    A(A),
-
-    #[di]
-    B(B),
-}
-
-// Register `fn(cx) -> () { Run(cx.resolve::<B>(), cx.resolve::<C>()) }` as the constructor for `()`
+#[derive(Debug, Clone)]
 #[Singleton]
-fn Run(b: B, c: C) {
-    println!("{:?}", b);
-    assert!(matches!(c, C::B(_)));
-}
+struct Config;
 
+#[Transient]
+struct Service(Config);
+```
+
+3. Create a context and resolve:
+
+```rust
 fn main() {
-    // Automatically register all types and functions with the `#[Singleton]`, `#[Transient]` or `#[SingleOwner]` attribute.
     let mut cx = Context::auto_register();
-
-    // Get an instance of `()` from the `Context`, which will call the `Run` function.
-    // This is equivalent to `cx.resolve::<()>();`
-    cx.resolve()
+    let service = cx.resolve::<Service>();
 }
 ```
 
-## Features
+## Async Support
 
-- Three scopes: [`Singleton`](https://docs.rs/rudi/latest/rudi/enum.Scope.html#variant.Singleton), [`Transient`](https://docs.rs/rudi/latest/rudi/enum.Scope.html#variant.Transient) and [`SingleOwner`](https://docs.rs/rudi/latest/rudi/enum.Scope.html#variant.SingleOwner) ([example](./examples/all-scope/)).
-- Async functions and async constructors.
-- Attribute macros can be used on `struct`, `enum`, `impl block` and `function`.
-- Manual and automatic registration (thanks to [inventory](https://github.com/dtolnay/inventory)).
-- Easy binding of trait implementations and trait objects.
-- Distinguishing different instances with types and names.
-- Generics (but must be monomorphized and manually registered) ([example](./examples/hello-world-with-generic/)).
-- Conditional registration ([example](./examples/condition/)).
-- References (only `Singleton` and `SingleOwner` scope) ([example](./examples/reference/)).
-
-## More complex example
+Rudi supports async constructors natively. Declare providers with `async fn` or the
+`async` attribute and resolve them with `_async` method variants:
 
 ```rust
-use std::{fmt::Debug, rc::Rc};
-
 use rudi::{Context, Singleton, Transient};
 
-// Register `async fn(cx) -> i32 { 42 }` as the constructor for `i32`,
-// and specify the name of the instance of this `i32` type as `"number"`.
-#[Singleton(name = "number")]
-async fn Number() -> i32 {
-    42
-}
-
-// Register `async fn(cx) -> Foo { Foo { number: cx.resolve_with_name_async("number").await } }`
-// as the constructor for `Foo`, and specify the name of the instance of this `Foo` type as `"foo"`.
-#[derive(Debug, Clone)]
-#[Singleton(async, name = "foo")]
-struct Foo {
-    #[di(name = "number")]
-    number: i32,
-}
-
-#[derive(Debug)]
-struct Bar(Foo);
-
-impl Bar {
-    fn into_debug(self) -> Rc<dyn Debug> {
-        Rc::new(self)
-    }
-}
-
-// Register `async fn(cx) -> Bar { Bar::new(cx.resolve_with_name_async("foo").await).await }`
-// as the constructor for `Bar`.
-//
-// Bind the implementation of the `Debug` trait and the trait object of the `Debug` trait,
-// it will register `asycn fn(cx) -> Rc<dyn Debug> { Bar::into_debug(cx.resolve_async().await) }`
-// as the constructor for `Rc<dyn Debug>`.
-#[Transient(binds = [Self::into_debug])]
-impl Bar {
-    #[di]
-    async fn new(#[di(name = "foo")] f: Foo) -> Bar {
-        Bar(f)
-    }
-}
-
 #[Singleton]
-async fn Run(bar: Bar, debug: Rc<dyn Debug>, #[di(name = "foo")] f: Foo) {
-    println!("{:?}", bar);
-    assert_eq!(format!("{:?}", bar), format!("{:?}", debug));
-    assert_eq!(format!("{:?}", bar.0.number), format!("{:?}", f.number));
+async fn DatabasePool() -> Pool {
+    Pool::connect("postgres://localhost/mydb").await
 }
+
+#[Transient(async)]
+struct Repository(Pool);
 
 #[tokio::main]
 async fn main() {
-    let mut cx = Context::auto_register();
-
-    cx.resolve_async().await
+    let mut cx = Context::auto_register_async().await;
+    let repo = cx.resolve_async::<Repository>().await;
 }
 ```
 
-More examples can be found in the [examples](./examples/) and [tests](./rudi/tests/) directories.
+## Module System
 
-## Credits
+Organize providers into logical groups using the `Module` trait:
 
-- [Koin](https://github.com/InsertKoinIO/koin): This project's API design and test cases were inspired by Koin.
-- [inventory](https://github.com/dtolnay/inventory): This project uses inventory to implement automatic registration, making Rust's automatic registration very simple.
+```rust
+use rudi::{components, modules, Context, DynProvider, Module, Singleton, Transient};
 
-## Contributing
+#[derive(Clone)]
+#[Singleton]
+struct AppConfig;
 
-Thanks for your help improving the project! We are so happy to have you!
+#[Transient]
+struct Handler(AppConfig);
+
+struct AppModule;
+
+impl Module for AppModule {
+    fn providers() -> Vec<DynProvider> {
+        components![AppConfig, Handler]
+    }
+}
+
+fn main() {
+    let mut cx = Context::create(modules![AppModule]);
+    let handler = cx.resolve::<Handler>();
+}
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `rudi-macro` feature | Enabled | Enables `#[Singleton]`, `#[Transient]`, `#[SingleOwner]` attribute macros |
+| `auto-register` feature | Enabled | Enables automatic provider registration via `inventory` |
+| `tracing` feature | Disabled | Adds structured logging for resolution events |
+| `allow_override` option | `true` | Whether providers can override existing registrations |
+| `allow_only_single_eager_create` option | `true` | Whether only Singleton/SingleOwner providers are eligible for eager creation |
+| `eager_create` option | `false` | Whether to eagerly instantiate providers at context creation |
+
+## Documentation
+
+Full documentation is available in the [docs/](docs/index.md) directory:
+
+- [Product Overview](docs/product/overview.md) -- vision, capabilities, and value proposition
+- [Getting Started](docs/user/getting-started.md) -- installation, configuration, and first run
+- [Architecture](docs/technical/architecture.md) -- crate structure, component design, and key decisions
+- [Context API Reference](docs/technical/context-api.md) -- complete Context method reference
 
 ## License
 
 Licensed under either of
 
-- Apache License, Version 2.0,([LICENSE-APACHE](./LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](./LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-  at your option.
 
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+at your option.
